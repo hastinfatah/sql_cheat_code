@@ -1,6 +1,6 @@
 SELECT
     column_name
-		, udt_name 
+   , udt_name 
 FROM
     information_schema.columns
 WHERE
