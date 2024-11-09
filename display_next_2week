@@ -1,0 +1,139 @@
+-- mart.mart_sale_contract_weekly source
+
+CREATE MATERIALIZED VIEW mart.mart_sale_contract_weekly
+TABLESPACE pg_default
+AS WITH cte_stock_allocation AS (
+         SELECT demand_dc_contract_allocation.contract_line_id,
+            demand_dc_contract_allocation.week::integer AS week_number,
+            demand_dc_contract_allocation.stock_allocation,
+            demand_dc_contract_allocation.incoming_allocation,
+            demand_dc_contract_allocation.stock_allocation + demand_dc_contract_allocation.incoming_allocation AS total_allocation
+           FROM raw_abu_prod_ent.demand_dc_contract_allocation
+        UNION
+         SELECT demand_branch_contract_allocation.contract_line_id,
+            demand_branch_contract_allocation.week::integer AS week_number,
+            demand_branch_contract_allocation.stock_allocation,
+            demand_branch_contract_allocation.incoming_allocation,
+            demand_branch_contract_allocation.stock_allocation + demand_branch_contract_allocation.incoming_allocation AS total_allocation
+           FROM raw_abu_prod_ent.demand_branch_contract_allocation
+        ), cte_abu_sales_contract_line_product_product_rel_raw AS (
+         SELECT abu_sales_contract_line_product_product_rel.abu_sales_contract_line_id,
+            abu_sales_contract_line_product_product_rel.product_product_id,
+            row_number() OVER (PARTITION BY abu_sales_contract_line_product_product_rel.abu_sales_contract_line_id ORDER BY abu_sales_contract_line_product_product_rel.product_product_id) AS rn
+           FROM raw_abu_prod_com.abu_sales_contract_line_product_product_rel
+        ), cte_abu_sales_contract_line_product_product_rel AS (
+         SELECT cte_abu_sales_contract_line_product_product_rel_raw.abu_sales_contract_line_id,
+            cte_abu_sales_contract_line_product_product_rel_raw.product_product_id,
+            cte_abu_sales_contract_line_product_product_rel_raw.rn
+           FROM cte_abu_sales_contract_line_product_product_rel_raw
+          WHERE cte_abu_sales_contract_line_product_product_rel_raw.rn = 1
+        ), cte_week AS (
+         SELECT abu_week_plan_line.week_id,
+            abu_week_plan_line.abu_scl_id,
+            abu_week_plan_line.abu_sc_id,
+            abu_week_plan_line.qty_plan,
+            abu_week_plan_line.ordered_qty,
+            abu_week_plan_line.qty_delivery,
+            master_week.sequence_code,
+            master_week.name AS week_name,
+            master_week.week AS week_number,
+            master_week.year,
+            master_week.start::date AS week_start,
+            master_week."end"::date AS week_end,
+            CURRENT_DATE AS "current_date",
+                CASE
+                    WHEN CURRENT_DATE >= master_week.start::date AND CURRENT_DATE <= master_week."end"::date THEN 1
+                    ELSE 0
+                END AS is_current_week,
+                CASE
+                    WHEN CURRENT_DATE > master_week."end"::date THEN 1
+                    ELSE 0
+                END AS is_last_week,
+                CASE
+                    WHEN CURRENT_DATE < master_week.start::date THEN 1
+                    ELSE 0
+                END AS is_next_week
+           FROM raw_abu_prod_com.abu_week_plan_line abu_week_plan_line
+             LEFT JOIN raw_abu_prod_com.master_week master_week ON abu_week_plan_line.week_id = master_week.id
+        ), cte_current_week_info AS (
+         SELECT cte_week_1.week_number,
+            cte_week_1.year
+           FROM cte_week cte_week_1
+          WHERE cte_week_1.is_current_week = 1
+         LIMIT 1
+        ), cte_max_week_current_year AS (
+         SELECT max(cte_week_1.week_number) AS max_week_number
+           FROM cte_week cte_week_1
+          WHERE cte_week_1.year::double precision = date_part('year'::text, CURRENT_DATE)
+        ), cte_final_week AS (
+         SELECT cte_week_1.week_id,
+            cte_week_1.abu_scl_id,
+            cte_week_1.abu_sc_id,
+            cte_week_1.qty_plan,
+            cte_week_1.ordered_qty,
+            cte_week_1.qty_delivery,
+            cte_week_1.sequence_code,
+            cte_week_1.week_name,
+            cte_week_1.week_number,
+            cte_week_1.year,
+            cte_week_1.week_start,
+            cte_week_1.week_end,
+            cte_week_1."current_date",
+            cte_week_1.is_current_week,
+            cte_week_1.is_last_week,
+            cte_week_1.is_next_week,
+                CASE
+                    WHEN cte_week_1.year = cte_current_week_info.year AND cte_week_1.week_number >= cte_current_week_info.week_number AND cte_week_1.week_number <= LEAST(cte_current_week_info.week_number + 2, cte_max_week_current_year.max_week_number) THEN 1
+                    WHEN cte_week_1.year = (cte_current_week_info.year + 1) AND cte_week_1.week_number <= (2 - (cte_max_week_current_year.max_week_number - cte_current_week_info.week_number)) THEN 1
+                    ELSE 0
+                END AS is_next_2week
+           FROM cte_week cte_week_1
+             JOIN cte_current_week_info ON cte_week_1.year = cte_current_week_info.year OR cte_week_1.year = (cte_current_week_info.year + 1)
+             JOIN cte_max_week_current_year ON cte_week_1.year::double precision = date_part('year'::text, CURRENT_DATE)
+        )
+ SELECT res_users.login AS sales_person_code,
+    res_partner.ref AS customer_id,
+    res_partner.name AS customer_name,
+    res_branch.name AS branch_name,
+    abu_sales_contract.name AS contract_name,
+    res_branch.code AS branch_code,
+    abu_sales_contract.state AS contract_state,
+    abu_sales_contract.start_date AS contract_start_date,
+    abu_sales_contract.end_date AS contract_end_date,
+    product_product.default_code AS product_code,
+    product_template.name::jsonb ->> 'en_US'::text AS product_name,
+    product_category.name AS product_category_name,
+    abu_sales_contract_line.name AS product_sub_category_name,
+    abu_sales_contract_line.abu_sc_id AS contact_id,
+    abu_sales_contract_line.category_id AS sub_category_id,
+    abu_sales_contract_line.qty AS total_contract_quantity,
+    abu_sales_contract_line.ordered_qty AS total_order_product_quantity,
+    abu_sales_contract_line.qty_delivery AS total_delivery_product_quantity,
+    cte_week.week_id,
+    cte_week.week_number,
+    cte_week.year,
+    cte_week.sequence_code AS week_sequence,
+    cte_week.week_start,
+    cte_week.week_end,
+    cte_week.qty_plan AS plan_weekly_quantity,
+    cte_week.ordered_qty AS order_weekly_quantity,
+    cte_week.qty_delivery AS delivery_weekly_quantity,
+    cte_stock_allocation.stock_allocation AS stock_allocation_weekly_quantity,
+    cte_stock_allocation.incoming_allocation AS incoming_allocation_weekly_quantity,
+    cte_stock_allocation.total_allocation AS total_allocation_weekly_quantity,
+    cte_week.is_current_week,
+    cte_week.is_next_week,
+    cte_week.is_last_week,
+    cte_week.is_next_2week
+   FROM raw_abu_prod_com.abu_sales_contract abu_sales_contract
+     LEFT JOIN raw_abu_prod_com.res_partner res_partner ON res_partner.id = abu_sales_contract.partner_id
+     LEFT JOIN raw_abu_prod_com.res_branch res_branch ON res_branch.id = abu_sales_contract.branch_id
+     LEFT JOIN raw_abu_prod_com.abu_sales_contract_line abu_sales_contract_line ON abu_sales_contract.id = abu_sales_contract_line.abu_sc_id
+     LEFT JOIN cte_abu_sales_contract_line_product_product_rel abu_sales_contract_lineproduct_productr ON abu_sales_contract_lineproduct_productr.abu_sales_contract_line_id = abu_sales_contract_line.id
+     LEFT JOIN raw_abu_prod_com.product_product product_product ON abu_sales_contract_lineproduct_productr.product_product_id = product_product.id
+     LEFT JOIN raw_abu_prod_com.product_template product_template ON product_template.id = product_product.product_tmpl_id
+     LEFT JOIN raw_abu_prod_com.product_category product_category ON product_category.id = product_template.categ_id
+     LEFT JOIN cte_final_week cte_week ON cte_week.abu_scl_id = abu_sales_contract_line.id
+     LEFT JOIN raw_abu_prod_com.res_users res_users ON res_users.id = abu_sales_contract.user_id
+     LEFT JOIN cte_stock_allocation ON abu_sales_contract_line.id = cte_stock_allocation.contract_line_id AND cte_week.sequence_code = cte_stock_allocation.week_number
+WITH DATA;
